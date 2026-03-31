@@ -15,9 +15,6 @@ import java.awt.image.BufferedImage;
 @RequiredArgsConstructor
 public class WatermarkService {
 
-    // ==============================
-    // EMBEDDING PHASE
-    // ==============================
     public EmbedResponse embed(MultipartFile file) throws Exception {
         BufferedImage input = ImageIO.read(file.getInputStream());
         BufferedImage gray = ImageUtils.convertToGrayscale(input);
@@ -86,9 +83,6 @@ public class WatermarkService {
                 .build();
     }
 
-    // ==============================
-    // DETECT & RECOVER PHASE
-    // ==============================
     public DetectResponse detectAndRecover(MultipartFile file) throws Exception {
         BufferedImage attacked = ImageIO.read(file.getInputStream());
         attacked = ImageUtils.convertToGrayscale(attacked);
@@ -217,9 +211,6 @@ public class WatermarkService {
         return (r1 << 8) | (r2 << 7) | (r3 << 6) | (r4 << 5) | (r3_prime << 2);
     }
 
-    // ============================================================
-    // THE FALSE-POSITIVE ELIMINATOR (Perfect IDWT)
-    // ============================================================
 
     private void embedBlockWithSearch(BufferedImage out, int i, int j, int origA, int origB, int origC, int origD,
                                       int targetLL, int targetLH, int targetHL, int targetHH) {
@@ -266,9 +257,6 @@ public class WatermarkService {
         writeBlock(out, i, j, bestA, bestB, bestC, bestD);
     }
 
-    // ============================================================
-    // UTILITIES
-    // ============================================================
 
     private void computeDWT(BufferedImage img, int[][] LL, int[][] LH, int[][] HL, int[][] HH) {
         for (int i = 0; i < LL.length; i++) {

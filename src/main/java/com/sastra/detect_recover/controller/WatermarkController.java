@@ -16,9 +16,6 @@ public class WatermarkController {
 
     private final WatermarkService watermarkService;
 
-    // =========================
-    // EMBED
-    // =========================
     @PostMapping("/embed")
     public ResponseEntity<EmbedResponse> embed(
             @RequestParam("image") MultipartFile file
@@ -28,9 +25,6 @@ public class WatermarkController {
         return ResponseEntity.ok(response);
     }
 
-    // =========================
-    // DETECT & RECOVER
-    // =========================
     @PostMapping("/detect-recover")
     public ResponseEntity<DetectResponse> detectAndRecover(
             @RequestParam("image") MultipartFile file
