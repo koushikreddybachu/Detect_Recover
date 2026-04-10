@@ -10,10 +10,14 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
+import java.util.Random;
 
 @Service
 @RequiredArgsConstructor
 public class WatermarkService {
+
+    private static final long SEED_1 = 123456789L;
+    private static final long SEED_2 = 987654321L;
 
     public EmbedResponse embed(MultipartFile file) throws Exception {
         BufferedImage input = ImageIO.read(file.getInputStream());
@@ -24,15 +28,17 @@ public class WatermarkService {
         int height = gray.getHeight();
         int rows = height / 2;
         int cols = width / 2;
+        int totalBlocks = rows * cols;
 
-        // Prevent IDWT bounds overflow (guarantees pixel safety during bit manipulation)
         BufferedImage prepared = safeClampImage(gray);
 
         int[][] LL = new int[rows][cols], LH = new int[rows][cols];
         int[][] HL = new int[rows][cols], HH = new int[rows][cols];
         computeDWT(prepared, LL, LH, HL, HH);
 
-        // 1. Generate Watermarks for all blocks (based on exact 9-bit logic)
+        int[] perm1 = generatePermutation(totalBlocks, SEED_1);
+        int[] perm2 = generatePermutation(totalBlocks, SEED_2);
+
         WatermarkBits[][] watermarks = new WatermarkBits[rows][cols];
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
@@ -40,30 +46,39 @@ public class WatermarkService {
             }
         }
 
-        // 2. Prepare Target Coefficients with Embedded Bits
         int[][] targetLL = cloneArray(LL), targetLH = cloneArray(LH);
         int[][] targetHL = cloneArray(HL), targetHH = cloneArray(HH);
 
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
                 WatermarkBits w = watermarks[i][j];
+                int blockIdx = i * cols + j;
 
-                // Embed Auth into Self (LL bits 3, 2, 1 -> LSB4, LSB3, LSB2)
-                targetLL[i][j] = (targetLL[i][j] & ~0b1110) | (w.a1 << 3) | (w.a2 << 2) | (w.a3 << 1);
+                int ll_embed = (w.a1 << 2) | (w.a2 << 1) | w.a3;
+                targetLL[i][j] = (targetLL[i][j] & ~0b1110) | (ll_embed << 1);
 
-                // Partner 1 (Horizontal Shift): LH1 bits 2,1,0 & HH1 bits 3,2
-                int y1_i = i, y1_j = (j + cols / 2) % cols;
-                targetLH[y1_i][y1_j] = (targetLH[y1_i][y1_j] & ~0b0111) | (w.r1 << 2) | (w.r2 << 1) | w.r3;
-                targetHH[y1_i][y1_j] = (targetHH[y1_i][y1_j] & ~0b1100) | (w.r4 << 3) | (w.r5 << 2);
+                int p1_idx = perm1[blockIdx];
+                int y1_i = p1_idx / cols;
+                int y1_j = p1_idx % cols;
 
-                // Partner 2 (Vertical Shift): HL1 bits 2,1,0 & HH1 bits 1,0
-                int y2_i = (i + rows / 2) % rows, y2_j = j;
-                targetHL[y2_i][y2_j] = (targetHL[y2_i][y2_j] & ~0b0111) | (w.r1 << 2) | (w.r2 << 1) | w.r3;
-                targetHH[y2_i][y2_j] = (targetHH[y2_i][y2_j] & ~0b0011) | (w.r4 << 1) | w.r5;
+                int lh_embed = (w.r1 << 2) | (w.r2 << 1) | w.r3;
+                int hh1_embed = (w.r4 << 1) | w.r5;
+
+                targetLH[y1_i][y1_j] = optimalLsbSubstitute(targetLH[y1_i][y1_j], lh_embed, 0b0111, 0);
+                targetHH[y1_i][y1_j] = (targetHH[y1_i][y1_j] & ~0b1100) | (hh1_embed << 2);
+
+                int p2_idx = perm2[blockIdx];
+                int y2_i = p2_idx / cols;
+                int y2_j = p2_idx % cols;
+
+                int hl_embed = (w.r1 << 2) | (w.r2 << 1) | w.r3;
+                int hh2_embed = (w.r4 << 1) | w.r5;
+
+                targetHL[y2_i][y2_j] = optimalLsbSubstitute(targetHL[y2_i][y2_j], hl_embed, 0b0111, 0);
+                targetHH[y2_i][y2_j] = (targetHH[y2_i][y2_j] & ~0b0011) | hh2_embed;
             }
         }
 
-        // 3. Perfect IDWT Reconstruction (Local Search prevents integer truncation false-positives)
         BufferedImage watermarked = new BufferedImage(width, height, BufferedImage.TYPE_BYTE_GRAY);
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
@@ -89,23 +104,23 @@ public class WatermarkService {
         attacked = ImageUtils.padToEven(attacked);
 
         int rows = attacked.getHeight() / 2, cols = attacked.getWidth() / 2;
+        int totalBlocks = rows * cols;
         int[][] LL = new int[rows][cols], LH = new int[rows][cols];
         int[][] HL = new int[rows][cols], HH = new int[rows][cols];
         computeDWT(attacked, LL, LH, HL, HH);
 
+        int[] perm1 = generatePermutation(totalBlocks, SEED_1);
+        int[] perm2 = generatePermutation(totalBlocks, SEED_2);
+
         boolean[][] tamperMap = new boolean[rows][cols];
         int tamperedCount = 0;
 
-        // 1. Detection Phase
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
                 int blockIdx = i * cols + j;
                 int llVal = LL[i][j];
 
-                // Extract embedded Auth (bits 3,2,1)
                 int extA1 = (llVal >> 3) & 1, extA2 = (llVal >> 2) & 1, extA3 = (llVal >> 1) & 1;
-
-                // Recompute Auth from upper bits (8 to 4)
                 WatermarkBits recomputed = generateBits(llVal, blockIdx);
 
                 if (extA1 != recomputed.a1 || extA2 != recomputed.a2 || extA3 != recomputed.a3) {
@@ -114,14 +129,20 @@ public class WatermarkService {
             }
         }
 
-        tamperMap = applyMorphologicalFilter(tamperMap); // 3x3 filter as per paper
+        tamperMap = applyMorphologicalFilter(tamperMap);
+        boolean[][] recoveredMap = new boolean[rows][cols];
+
         for (int i = 0; i < rows; i++) {
             for (int j = 0; j < cols; j++) {
-                if (tamperMap[i][j]) tamperedCount++;
+                if (tamperMap[i][j]) {
+                    tamperedCount++;
+                    recoveredMap[i][j] = false;
+                } else {
+                    recoveredMap[i][j] = true;
+                }
             }
         }
 
-        // 2. Recovery Phase (Following strict paper specifications)
         BufferedImage recovered = new BufferedImage(attacked.getWidth(), attacked.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
 
         for (int i = 0; i < rows; i++) {
@@ -132,29 +153,62 @@ public class WatermarkService {
                 int d = attacked.getRaster().getSample(j * 2 + 1, i * 2 + 1, 0);
 
                 if (tamperMap[i][j]) {
-                    int y1_i = i, y1_j = (j + cols / 2) % cols;
-                    int y2_i = (i + rows / 2) % rows, y2_j = j;
+                    int blockIdx = i * cols + j;
+
+                    int p1_idx = perm1[blockIdx];
+                    int y1_i = p1_idx / cols;
+                    int y1_j = p1_idx % cols;
+
+                    int p2_idx = perm2[blockIdx];
+                    int y2_i = p2_idx / cols;
+                    int y2_j = p2_idx % cols;
+
                     Integer recLL = null;
 
-                    // Fetch from Y1
                     if (!tamperMap[y1_i][y1_j]) {
                         recLL = reconstructLL(LH[y1_i][y1_j] & 0b111, (HH[y1_i][y1_j] >> 2) & 0b11);
-                    }
-                    // Fetch from Y2
-                    else if (!tamperMap[y2_i][y2_j]) {
+                    } else if (!tamperMap[y2_i][y2_j]) {
                         recLL = reconstructLL(HL[y2_i][y2_j] & 0b111, HH[y2_i][y2_j] & 0b11);
                     }
 
                     if (recLL != null) {
-                        // The paper dictates keeping the original LH, HL, HH of the attacked block during IDWT
-                        a = clamp((recLL + LH[i][j] + HL[i][j] + HH[i][j]) / 2);
-                        b = clamp((recLL - LH[i][j] + HL[i][j] - HH[i][j]) / 2);
-                        c = clamp((recLL + LH[i][j] - HL[i][j] - HH[i][j]) / 2);
-                        d = clamp((recLL - LH[i][j] - HL[i][j] + HH[i][j]) / 2);
+                        int recoveredPixel = clamp(recLL / 2);
+                        a = recoveredPixel; b = recoveredPixel; c = recoveredPixel; d = recoveredPixel;
+                        recoveredMap[i][j] = true;
+                    } else {
+                        a = 0; b = 0; c = 0; d = 0;
                     }
                 }
                 writeBlock(recovered, i, j, a, b, c, d);
             }
+        }
+
+        for (int pass = 0; pass < 2; pass++) {
+            boolean[][] nextRecoveredMap = cloneBooleanArray(recoveredMap);
+            for (int i = 0; i < rows; i++) {
+                for (int j = 0; j < cols; j++) {
+                    if (!recoveredMap[i][j]) {
+                        int sumA = 0, sumB = 0, sumC = 0, sumD = 0, count = 0;
+                        for (int di = -1; di <= 1; di++) {
+                            for (int dj = -1; dj <= 1; dj++) {
+                                int ni = i + di, nj = j + dj;
+                                if (ni >= 0 && ni < rows && nj >= 0 && nj < cols && recoveredMap[ni][nj]) {
+                                    sumA += recovered.getRaster().getSample(nj * 2, ni * 2, 0);
+                                    sumB += recovered.getRaster().getSample(nj * 2 + 1, ni * 2, 0);
+                                    sumC += recovered.getRaster().getSample(nj * 2, ni * 2 + 1, 0);
+                                    sumD += recovered.getRaster().getSample(nj * 2 + 1, ni * 2 + 1, 0);
+                                    count++;
+                                }
+                            }
+                        }
+                        if (count > 0) {
+                            writeBlock(recovered, i, j, sumA/count, sumB/count, sumC/count, sumD/count);
+                            nextRecoveredMap[i][j] = true;
+                        }
+                    }
+                }
+            }
+            recoveredMap = nextRecoveredMap;
         }
 
         return DetectResponse.builder()
@@ -165,15 +219,45 @@ public class WatermarkService {
     }
 
     // ============================================================
-    // PAPER-STRICT LOGIC
+    // UTILITY & MATHEMATICAL METHODS
     // ============================================================
+
+    private int[] generatePermutation(int size, long seed) {
+        int[] perm = new int[size];
+        for (int i = 0; i < size; i++) perm[i] = i;
+        Random rnd = new Random(seed);
+        for (int i = size - 1; i > 0; i--) {
+            int j = rnd.nextInt(i + 1);
+            int temp = perm[i];
+            perm[i] = perm[j];
+            perm[j] = temp;
+        }
+        return perm;
+    }
+
+    private int optimalLsbSubstitute(int original, int embeddedBits, int mask, int shift) {
+        int replaced = (original & ~mask) | (embeddedBits << shift);
+        int step = Integer.highestOneBit(mask) << 1;
+
+        int opt1 = replaced;
+        int opt2 = replaced + step;
+        int opt3 = replaced - step;
+
+        int d1 = Math.abs(original - opt1);
+        int d2 = Math.abs(original - opt2);
+        int d3 = Math.abs(original - opt3);
+
+        if (d1 <= d2 && d1 <= d3) return opt1;
+        if (d2 <= d1 && d2 <= d3) return opt2;
+        return opt3;
+    }
 
     private WatermarkBits generateBits(int llVal, int blockIdx) {
         WatermarkBits wb = new WatermarkBits();
-        // Exact 9-bit depth indexing (bits 8 down to 0)
         int msb1 = (llVal >> 8) & 1, msb2 = (llVal >> 7) & 1, msb3 = (llVal >> 6) & 1;
         int msb4 = (llVal >> 5) & 1, msb5 = (llVal >> 4) & 1, msb6 = (llVal >> 3) & 1, msb7 = (llVal >> 2) & 1;
 
+        // 1. Generate Recovery Bits (Preserved from original logic)
         int r1 = (msb1 << 2) | (msb2 << 1) | msb3;
         int r2 = (msb2 << 2) | (msb3 << 1) | msb4;
         int r3 = (msb5 << 2) | (msb6 << 1) | msb7;
@@ -181,21 +265,22 @@ public class WatermarkService {
         wb.r1 = msb1; wb.r2 = msb2; wb.r3 = msb3; wb.r4 = msb4;
         wb.r5 = (Math.abs(r1 - r3) <= Math.abs(r2 - r3)) ? 1 : 0;
 
-        // Authentication Hashes
-        int a1 = r1;
-        int a2 = (msb4 << 1) | msb5;
+        // 2. NEW: Cryptographic Spatial Authentication (Defeats Copy-Move)
+        // Strictly uses only the top 5 bits (bits unaffected by embedding)
+        int top5Bits = (llVal >> 4) & 0b11111;
 
-        wb.a1 = ((a1 + a2) % 2 == 0) ? 1 : 0;
+        // Integer Avalanche Hash (Murmur3 Finalizer logic)
+        // This completely scrambles the structural bits with the exact spatial location
+        int hash = (top5Bits * 31) + blockIdx;
+        hash ^= (hash >>> 16);
+        hash *= 0x85ebca6b;
+        hash ^= (hash >>> 13);
+        hash *= 0xc2b2ae35;
+        hash ^= (hash >>> 16);
 
-        // Rigorous definitions for LSB1 and LSB2 based on the block moduli
-        int m1 = blockIdx % 2;
-        int m2 = blockIdx % 3;
-        int lsb1_m1 = (a1 >> m1) & 1;
-        int lsb2_m2 = (a2 >> (m2 % 2)) & 1;
-        int lsb1_m2 = (a1 >> m2) & 1;
-
-        wb.a2 = lsb1_m1 ^ lsb2_m2;
-        wb.a3 = lsb1_m1 ^ lsb1_m2;
+        wb.a1 = (hash >> 2) & 1;
+        wb.a2 = (hash >> 1) & 1;
+        wb.a3 = hash & 1;
 
         return wb;
     }
@@ -204,29 +289,22 @@ public class WatermarkService {
         int r1 = (r123 >> 2) & 1, r2 = (r123 >> 1) & 1, r3 = r123 & 1;
         int r4 = (r45 >> 1) & 1, r5 = r45 & 1;
 
-        // Eq. 11: Generate r3'
         int r3_prime = (r5 == 1) ? ((r1 << 2) | (r2 << 1) | r3) : ((r2 << 2) | (r3 << 1) | r4);
-
-        // "produced as 9 bits by adding 0 bits to the end"
         return (r1 << 8) | (r2 << 7) | (r3 << 6) | (r4 << 5) | (r3_prime << 2);
     }
 
-
     private void embedBlockWithSearch(BufferedImage out, int i, int j, int origA, int origB, int origC, int origD,
                                       int targetLL, int targetLH, int targetHL, int targetHH) {
-        // We MUST preserve bits 8 to 4 of LL (used for Auth computation), and bits 3 to 1 (the Auth bits themselves).
         int maskLL = 0b1_1111_1110, maskLH = 0b0111, maskHL = 0b0111, maskHH = 0b1111;
 
         int bestA = origA, bestB = origB, bestC = origC, bestD = origD;
         int minErr = Integer.MAX_VALUE;
 
-        // Base IDWT approximation
         int bA = clamp((targetLL + targetLH + targetHL + targetHH) / 2);
         int bB = clamp((targetLL - targetLH + targetHL - targetHH) / 2);
         int bC = clamp((targetLL + targetLH - targetHL - targetHH) / 2);
         int bD = clamp((targetLL - targetLH - targetHL + targetHH) / 2);
 
-        // Sub-pixel search (radius 5) forces the exact preservation of the mathematical remainder
         for(int da = -5; da <= 5; da++) {
             for(int db = -5; db <= 5; db++) {
                 for(int dc = -5; dc <= 5; dc++) {
@@ -253,10 +331,9 @@ public class WatermarkService {
             }
         }
 
-        if (minErr == Integer.MAX_VALUE) { bestA = bA; bestB = bB; bestC = bC; bestD = bD; } // Extremely rare fallback
+        if (minErr == Integer.MAX_VALUE) { bestA = bA; bestB = bB; bestC = bC; bestD = bD; }
         writeBlock(out, i, j, bestA, bestB, bestC, bestD);
     }
-
 
     private void computeDWT(BufferedImage img, int[][] LL, int[][] LH, int[][] HL, int[][] HH) {
         for (int i = 0; i < LL.length; i++) {
@@ -286,7 +363,7 @@ public class WatermarkService {
                         if(ni >= 0 && ni < rows && nj >= 0 && nj < cols && map[ni][nj]) count++;
                     }
                 }
-                filtered[i][j] = count >= 5; // Majority vote over 3x3
+                filtered[i][j] = count >= 2;
             }
         }
         return filtered;
@@ -296,7 +373,7 @@ public class WatermarkService {
         for (int y = 0; y < img.getHeight(); y++) {
             for (int x = 0; x < img.getWidth(); x++) {
                 int p = img.getRaster().getSample(x, y, 0);
-                img.getRaster().setSample(x, y, 0, Math.max(15, Math.min(240, p)));
+                img.getRaster().setSample(x, y, 0, Math.max(5, Math.min(250, p)));
             }
         }
         return img;
@@ -313,6 +390,12 @@ public class WatermarkService {
 
     private int[][] cloneArray(int[][] src) {
         int[][] dest = new int[src.length][];
+        for (int i = 0; i < src.length; i++) dest[i] = src[i].clone();
+        return dest;
+    }
+
+    private boolean[][] cloneBooleanArray(boolean[][] src) {
+        boolean[][] dest = new boolean[src.length][];
         for (int i = 0; i < src.length; i++) dest[i] = src[i].clone();
         return dest;
     }
